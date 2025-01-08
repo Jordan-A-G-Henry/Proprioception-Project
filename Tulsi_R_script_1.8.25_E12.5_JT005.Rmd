@@ -1,0 +1,1329 @@
+---
+title: "Tulsi R Multiomics Script"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+This notebook is a version of the script I inherited from another analyst, analyzing the JT001_2 P56 dataset, which I converted to notebook format. -- Having developed it to contain the necessary QC, screening and visualization steps, I'd like to now apply the same pipeline to the other 3 datasets, which represent proprioceptor cells at other developmental time-points. --The analysis should therefore be useful as a comparison of the transcriptional behavior of such cells across development.
+
+Except that there's an additional layer of information which I previously ignored in the P56 notebook: Proprioceptor cells express transcripts related both to the type of tissue they innervate and related to differentiation into different sub-types. --Two things: a.) The different combinations of sub-type markers mean different things at different developmental stages, making comparison difficult. b.) The balance of positional vs sub-type markers varies greatly by age. --At p56, the cells are not expressing much in the way of positional markers. Expression is dominated by sub-type markers, and so the clustering is primarily on the basis of sub-type. --At P0, it's quite mixed.
+
+*--Use this block to specify the dataset we'll be working with--*
+
+Dataset Notes:
+
+This dataset is JT005 --. These are E12.5 mouse proprioceptor cells. In this early datasets (pre-P0), the reporter gene used was Ntrk3. Cells were then dissected out of the DRG based on expression of a TdTomato reporter.
+
+```{r setup}
+
+knitr::opts_knit$set(root.dir = "C:\\Users\\Jordan Henry\\Proprioception Datasets\\JT005_E12.5")
+
+```
+
+
+```{r}
+#Current working directory:
+getwd()
+
+raw_dataset <- 'raw_feature_bc_matrix.h5'
+#We end up using the raw dataset only, I believe.
+dataset <-'filtered_feature_bc_matrix.h5'
+fr_file <- 'atac_fragments.tsv'
+#This file is required to have *exactly* the same name, and be located in the same folder!
+fr_index_file <- 'atac_fragments.tsv.gz.tbi'
+
+web_summary = "web_summary.html"
+
+#Screenshot of this section of the web summary
+joint_calling_image = "JT005_Joint_Cell_Calling.png"
+
+#Notes: This dataset comes from the 'multiomics adult' folder, currently located available on the Neurology department CTCN cluster (under: 'hpc'->'homes'->'jh4970'), and from the DeNooij lab cluster. --These are proprioceptor cells isolated from the DRG of adult mice, and sequenced using a single nucleus technique.
+```
+
+An initial visualization to see the information provided by 10X about
+this dataset. This information informs the decision to either accept the
+filtered feature matrix or to begin the pipeline using the raw feature
+matrix. --Here, the "Cells" represent items preserved in the filtered
+feature matrix. The raw matrix contains everything.
+
+```{r, echo=FALSE, fig.cap="A caption", out.width = '100%'}
+knitr::include_graphics(joint_calling_image)
+```
+
+The yellow dots are those included in the filtered matrix file. The filtering is actually quite logical here, but we'll use the raw matrix and do our own filtering. This figure confirms that 1000 UMIs seems like a reasonable cutoff value. This will gate out the majority of non-cell fragments. We can then apply dimensionality reduction techniques like
+PCA and UMAP, which should cause the cells to separate out more cleanly. --We can then select the clusters of interest and discard the rest.
+
+```{r}
+# Note: The console will probably ask you to restart R upon install. 
+#       Ignore this. It's a waste of time.
+
+# install.packages("Seurat", version = package_version('5.0.0'))  --Uncomment if necessary to reinstall.
+# install.packages("hdf5r")
+
+library(Seurat)
+library(hdf5r)
+```
+
+We initialize our seurat object using the raw/unfiltered matrix
+respectively, so that we can filter out non-cells in our own way.
+
+```{r}
+# Initialize the Seurat object with the raw (non-normalized data).
+
+# Load the 10x hdf5 file, which contains both data types. #path to cell ranger filtered matrix
+inputdata.10x <- Read10X_h5(raw_dataset)
+
+# extract RNA and ATAC data
+rna_counts <- inputdata.10x$`Gene Expression`
+atac_counts <- inputdata.10x$`Peaks`
+
+#create SeuratObject with RNA data only
+PSN <- CreateSeuratObject(counts = rna_counts)
+
+#Run this whenever you want to see what the object currently consists of
+PSN
+
+```
+
+```{r}
+#Additional packages to be installed after Seurat Object is created.
+#Collapse output after running, to avoid taking up space in the markdown file.
+
+# install.packages("dplyr")
+library(dplyr)
+
+# install.packages("Signac")
+library(Signac)
+
+# install.packages("BiocManager")
+library(BiocManager)
+
+# if (!require("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# BiocManager::install("EnsDb.Mmusculus.v79")
+library("EnsDb.Mmusculus.v79")
+
+# install.packages("ggplot2")
+library("ggplot2")
+
+
+# if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+# BiocManager::install("BSgenome.Mmusculus.UCSC.mm10")
+library(BSgenome.Mmusculus.UCSC.mm10)
+
+```
+
+```{r}
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+atac_counts <- atac_counts[as.vector(grange.use), ]
+
+#Shape of the new object.
+dim(atac_counts)
+```
+
+```{r}
+#Requests installation of biovizBase
+# if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+# BiocManager::install("biovizBase")
+```
+
+```{r}
+#To perform peak annotation, we import the relevant reference genome.
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "mm10"
+
+#Note: You will also need the ucsc seq info file for the reference genome you're using.
+#      Place this file in the same folder as your dataset.
+seq_info = "ucsc_mm10_seqinfo"
+```
+
+```{r}
+#Load the fragment file for dataset.
+frag.file <- fr_file
+#Load the specific ucsc_mm10_seqinfo file for reference chromosomes
+load(seq_info)
+ucsc_mm10_seqinfo=x
+```
+
+There's a problem here: The fragment file does not contain information
+for all the barcodes in the raw matrix. If attempting to build the
+ChromatinAssay using all cells in the raw matrix, you will recieve an
+error: Not all cells found.
+
+My initial interpretation of this was that the file only contained
+information on cells in the filtered matrix. After searching this
+problem online (<https://github.com/stuart-lab/signac/issues/848>), it
+seems more an issue with the sparsity of the data. Most of the objects
+in the raw matrix have very few RNA transcripts associated with them. It
+makes sense that a sizeable chunk of them do not have any fragments
+associated. Hence, the error.
+
+QC: Filtering out low expressing cells prior to running
+the assay will avoid this error.
+
+## Filter Matrix by counts:
+
+```{r}
+#Preserves almost all cells in the original matrix. 1k is a very reasonable cut-off to get rid of cell-fragments.
+PSN <- subset(PSN, subset = nCount_RNA > 1000)
+
+#PSN_plus <- subset(PSN, subset = nCount_RNA > 100 & nCount_RNA < 100000 )
+
+PSN
+```
+
+```{r}
+length(colnames(atac_counts))
+```
+
+Note: Even if PSN is "pre-filtered", the 'atac_counts' matrix still
+contains features for all cells in the original raw matrix. --In order
+for this to work, it seems that we would need to filter this matrix to
+remove any points that don't show up in the now-filtered PSN Seurat
+object.
+
+```{r}
+kept_barcodes <- Cells(PSN)
+#kept_barcodes
+length(kept_barcodes)
+```
+
+To filter 'atac_counts' for only these columns.
+
+```{r}
+library(Matrix)
+```
+
+```{r}
+#Fun fact: It took me an hour to figure out how to do this...
+atac_counts_sel <- atac_counts[, c(kept_barcodes)]
+length(colnames(atac_counts_sel))
+```
+
+The correct number! Should be the same as number of cells in the PSN
+seurat object.
+
+```{r}
+
+dim(atac_counts_sel)
+```
+
+
+```{r}
+#Create chromatin assay to add ATAC to Seurat Object
+chrom_assay <- CreateChromatinAssay(
+  counts = atac_counts_sel, #Replacing: atac_counts
+  sep = c(":", "-"),
+  #genome = 'mm10',
+  genome = ucsc_mm10_seqinfo,
+  fragments = frag.file,
+  min.cells = 10,
+  annotation = annotations,
+  #Returns an error if 'validate.fragments=TRUE'
+  validate.fragments=TRUE
+)
+```
+Note[1]: You will not explicitly be asked for the fragment index file, but
+without it you will recieve the error:
+
+'Error in GetIndexFile(fragment = path, verbose = verbose) : Fragment
+file is not indexed.'
+
+Index file needs to be located in the same directory as the fragment file,
+with the file extension ".tsv.tbi" (If it's ".tsv.gz.tbi", that doesn't seem to work.)
+
+
+--------
+Note[2]: I'm reading that 'validate.fragments=FALSE' should only be used
+when you're absolutely sure all the cells/objects being annotated are
+all present. Given that we're filtering out the vast majority of these
+objects anyway, it seems unlikely that any of them will remain in the
+dataset that don't have transcripts associated.
+
+```{r}
+chrom_assay
+```
+
+```{r}
+#Add the chrom_assay to the Seurat Object
+PSN[["ATAC"]] <- chrom_assay
+
+#PSN will now show 2 available assays
+PSN
+```
+
+Done!
+
+We can now move on to some visualizations! --This is where the notebook
+format outshines the simpe R script. Each figure is now embedded in a
+section of the notebook, along with the code that generates it. Much
+easier to keep track of.
+
+```{r}
+# Visualize RNA QC metrics as a violin plot
+VlnPlot(PSN, features = c("nFeature_RNA", "nCount_RNA"), ncol = 3)
+```
+
+```{r}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+#plot1 <- FeatureScatter(PSN, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(PSN, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+#plot1 + plot2
+plot2
+```
+
+Note: In my opinion, these two figures are not especially useful
+compared to the 'Joint Cell Calling' figure which is further above,
+which does a pretty good job of indicating the distribution of RNA and
+ATAC counts for both cells and non-cell objects. Duplicated here for
+utility:
+
+```{r, echo=FALSE, fig.cap="A caption", out.width = '100%'}
+knitr::include_graphics(joint_calling_image)
+```
+
+A common QC step is to filter cells based on RNA counts, choose a range
+so that clusters are not determined by RNA counts:
+
+The previous range for this step was 5k:25k. As you can see from the
+above figure, this would end up gating-out one of the two main clusters
+of cells. I'm in favor of including every possible bit of data, with the
+understanding that we can filter out clusters which don't appear to show
+signs of proprioceptor identity.
+
+I think a good workaround is to create two different subsets (one
+containing these extra cells), and see what the difference is.
+
+More inclusive subset: [We already did this. Moved further up in the
+notebook.]
+
+```{r}
+#Preserves almost all cells in the original matrix. 1k is a very reasonable cut-off to get rid of cell-fragments.
+# PSN <- subset(PSN, subset = nCount_RNA > 1000)
+
+#PSN_plus <- subset(PSN, subset = nCount_RNA > 100 & nCount_RNA < 100000 )
+
+# PSN
+```
+
+More restrictive subset:
+
+```{r}
+PSN_sub <- subset(PSN, subset = nCount_RNA > 5000 & nCount_RNA < 100000 )
+
+#check the new object again to ensure that the cell count has changed to reflect the filtering in the previous step
+PSN_sub
+```
+
+Notice the difference in number of samples at the end. Both are very
+good reductions from the previous number of objects.
+
+```{r}
+#We didn't use this transform method - could look into it later if want to use
+#SCT transform method
+#DefaultAssay(PSN) <- "RNA"
+#PSN <- SCTransform(PSN, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+```
+
+```{r}
+#old method of RNA normalization and clustering- new method is called SCT and can also be used
+PSN <- NormalizeData(PSN, normalization.method = "LogNormalize", scale.factor = 10000)
+PSN <- FindVariableFeatures(PSN, selection.method = "vst", nfeatures = 2000)
+
+PSN_sub <- NormalizeData(PSN, normalization.method = "LogNormalize", scale.factor = 10000)
+PSN_sub <- FindVariableFeatures(PSN, selection.method = "vst", nfeatures = 2000)
+```
+
+```{r}
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(PSN), 10)
+
+top10
+```
+
+```{r}
+# Identify the 10 most highly variable genes
+top10_plus <- head(VariableFeatures(PSN_sub), 10)
+
+top10_plus
+```
+
+```{r}
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(PSN)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+# plot1   #Not sure how useful this figure is without labels.
+
+plot2
+```
+
+```{r}
+#Scale the data
+all.genes <- rownames(PSN)
+PSN <- ScaleData(PSN, features = all.genes)
+```
+
+```{r}
+#Run PCA on the data
+PSN <- RunPCA(PSN, features = VariableFeatures(object = PSN))
+```
+
+```{r}
+# Examine and visualize PCA results a few different ways
+print(PSN[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(PSN, dims = 1:2, reduction = "pca")
+DimPlot(PSN, reduction = "pca")
+DimHeatmap(PSN, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(PSN, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+```{r}
+#Never did this with our data, did elbow plot instead
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+#PSN <- JackStraw(PSN, num.replicate = 100)
+#PSN <- ScoreJackStraw(PSN, dims = 1:20)
+#JackStrawPlot(PSN, dims = 1:15)
+```
+
+```{r}
+#This is to determine how many dims (dimensions) to include in the clustering
+ElbowPlot(PSN)
+```
+
+```{r}
+PSN
+```
+
+Having performed dimensionality reduction on the dataset, what we'd like
+to do next is to generate a UMAP projection of these reduced dimensions
+and use such a projection to screen for the clusters expressing a number
+of positive and negative proprioceptor markers. Thus isolating the group
+of proprioceptors for downstream analysis.
+
+```{r}
+# If you haven't installed UMAP, you can do so via 
+#reticulate::py_install(packages ='umap-learn')
+```
+
+## Cluster Selection:
+
+The aim of this section is to select only the clusters containing the
+target cell-type (proprioceptors).
+
+At E12.5 cells, our proprioceptors *should* express Parvb and Runx3 if they are intact cells. (Add Ntrk3 and Etv1, to be extra sure.) --All of this should be true from at least P0. Before P0 thereis no Whirlin.
+
+Note: Isolating cells is not an exact process. Collecting RNA from that
+cell is also not an exact process. So, it's quite possible for a cell to
+be a proprioceptor and not express all 3 markers. --These cells should
+still cluster with the other proprioceptors on the basis of all the
+related genes that go into defining the PCs and thus, the UMAP
+projection. --So, what we gate out is the CLUSTERS which do not have any
+cells expressing any of the 5 markers of interest.
+
+Additional feedback: 1. Do not select only the largest groups which
+express the correct markers (and do not expect all the proprioceptor
+groups to clump together). There are at least 8 distinct proprioceptor
+identities in adult mice. 2. Experiment with a number of different
+dimensionalities and resolutions. a.) Selecting (eg. the first 8
+principle components vs the first 20) will yeild UMAPs with completely
+different organizations of cells. b.) The resolution value selected will
+determine the number of distinct groups.
+
+The following combinations were tried:
+
+Dim Res 8 0.2 15 0.5 20 0.8
+
+Of these, we settled on 20, 0.8 for the maximum resolution.
+
+### Dims = 1:20
+
+```{r}
+#https://learn.gencore.bio.nyu.edu/single-cell-rnaseq/seurat-part-4-cell-clustering/#:~:text=Seurat%20can%20help%20you%20find%20markers%20that%20define,clusters%20vs.%20each%20other%2C%20or%20against%20all%20cells.
+
+# save.SNN = T saves the SNN so that the clustering algorithm can be rerun
+# using the same graph but with a different resolution value (see docs for
+# full details)
+
+PSN <- RunUMAP(PSN, dims = 1:20)
+
+#here you can see what the RNAcount distribution looks like in the clusters
+FeaturePlot(PSN, features = c("nCount_RNA"))
+```
+
+### Res = 0.8
+
+```{r}
+#Need to generate the neighborhood graph as a pre-requisite for clustering!
+PSN <- FindNeighbors(PSN, reduction = "pca", dims = 1:20)
+
+PSN <- FindClusters(object = PSN, reduction.type = "pca", dims.use = 1:20, 
+    resolution = 0.8, print.output = 0, save.SNN = TRUE)
+
+DimPlot(PSN, label = TRUE, label.size = 2.5, repel = TRUE)
+```
+
+## Distributions of known features, to determine which clusters are actually proprioceptors:
+
+### Here we start with the aforementioned positive proprioceptor markers: Whrn, Parvb, Runx3 + Ntrk3 and Etv1
+
+Known positive markers for proprioceptor identity:
+
+```{r}
+FeaturePlot(PSN, features = "Whrn")
+FeaturePlot(PSN, features = "Parvb")
+FeaturePlot(PSN, features = "Runx3")
+FeaturePlot(PSN, features = "Etv1")
+FeaturePlot(PSN, features = "Ntrk3")
+```
+
+This should be helpful: Seurat provides means of quantifying mean
+expression based on group identity. An efficient screening tool.
+
+```{r}
+
+f_lis <- c("Whrn", "Parvb", "Runx3", "Etv1", "Ntrk3")
+
+exp = AverageExpression(
+  PSN,
+  assays = 'RNA',
+  features = f_lis,
+  return.seurat = FALSE,
+  group.by = "ident",
+  add.ident = NULL,
+  layer = "data",
+  verbose = TRUE
+)
+```
+
+```{r}
+exp <- data.frame(exp)
+exp
+```
+
+```{r}
+DotPlot(PSN, features = c('Whrn', 'Parvb', 'Runx3', 'Etv1', 'Ntrk3'))
+```
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+RidgePlot(PSN, features = c('Whrn', 'Parvb'))
+#Not very interesting...
+RidgePlot(PSN, features = c('Runx3'))
+RidgePlot(PSN, features = c('Etv1', 'Ntrk3'))
+```
+
+As noted: Most cells in each group do not express a particular marker
+gene. (But may express other genes correlated with it.) Hence, the logic
+of screening by cluster.
+
+## Known negative markers for proprioceptor identity: Ntrk2, Ret
+
+--Indicates non-prop mechanoreceptors.
+
+```{r}
+FeaturePlot(PSN, features = "Ntrk2")
+FeaturePlot(PSN, features = "Ret")
+```
+
+Another table for numerical comparison.
+
+```{r}
+
+f_lis <- c("Ntrk2", "Ret")
+
+exp = AverageExpression(
+  PSN,
+  assays = 'RNA',
+  features = f_lis,
+  return.seurat = FALSE,
+  group.by = "ident",
+  add.ident = NULL,
+  layer = "data",
+  verbose = TRUE
+)
+```
+
+```{r}
+exp <- data.frame(exp)
+exp
+```
+
+**Recall that Whrn-Ntrk3 are our positive markers for proprioceptor
+identity. --Ret & Ntrk2 are our negative markers.**
+
+```{r}
+DotPlot(PSN, features = c('Whrn', 'Parvb', 'Runx3', 'Etv1', 'Ntrk3','Ret', 'Ntrk2'))
+```
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+RidgePlot(PSN, features = c('Ret', 'Ntrk2'))
+```
+
+## Known proprioceptor subtype markers:
+
+```{r}
+FeaturePlot(PSN, features = "Nxph1")
+FeaturePlot(PSN, features = "Csmd3")
+```
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+RidgePlot(PSN, features = c('Nxph1', 'Csmd3'))
+```
+
+Miscellaneous:
+
+```{r}
+features = c("Pcdh17", "Itga2", "Heg1", "Slc17a7")
+FeaturePlot(PSN, features = features)
+```
+
+Dot-plot of the 6 potential subtype markers.
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN, features = c('Nxph1', 'Csmd3', 'Pcdh17', 'Itga2', 'Heg1', 'Slc17a7'))
+```
+
+## Screening for Additional sub-typ markers: 
+
+Note that these will vary based on the developmental time-point. 
+(In the post-P0 timepoint, this list included: Calb1, Calb2, Hpse, Colq, Tac1, Zc3hav1, Irak4, Asb2, PdLim1, and Chad. I've found all these to be very sparsely expressed at this timepoint. --But we keep Tac1 and Pdlim1.)
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN, features = c('Tac1', 'Pdlim1', 'Pou4f1', 'Pou4f2', 'Pou4f3', 'Ngn1', 'Ngn2', 'Avil', 'Shox2'))
+```
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN, features = c('Cux2', 'Hoxc4', 'Hoxc5', 'Hoxc6', 'Hoxc7', 'Hoxc8', 'Hoxc9'))
+```
+Unfortunately, it appears that Ngn1, Ngn2 and Hoxc7 are not included in the feature panel for this dataset.
+
+```{r}
+
+#'Tac1', 'Pou4f1', 'Pou4f2', 'Pou4f3', 'Ngn1', 'Ngn2', 'Avil', 'Shox2', 'Cux2', 'Hoxc4', 'Hoxc5', 'Hoxc6', 'Hoxc7', 'Hoxc8', 'Hoxc9'
+
+FeaturePlot(PSN, features = "Tac1")
+FeaturePlot(PSN, features = "Pdlim1")
+FeaturePlot(PSN, features = "Pou4f1")
+FeaturePlot(PSN, features = "Pou4f2")
+FeaturePlot(PSN, features = "Pou4f3")
+#FeaturePlot(PSN, features = "Ngn1")
+#FeaturePlot(PSN, features = "Ngn2")
+FeaturePlot(PSN, features = "Avil")
+FeaturePlot(PSN, features = "Shox2")
+FeaturePlot(PSN, features = "Cux2")
+FeaturePlot(PSN, features = "Hoxc4")
+FeaturePlot(PSN, features = "Hoxc5")
+FeaturePlot(PSN, features = "Hoxc6")
+#FeaturePlot(PSN, features = "Hoxc7")
+FeaturePlot(PSN, features = "Hoxc8")
+FeaturePlot(PSN, features = "Hoxc9")
+```
+Note: These markers do not appear to be especially useful at P0...
+
+## Positional Markers
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN, features = c('Heg1', 'Pcdh8', 'Tox', 'Epha3', 'Gabrg1', 'Efna5', 'C1ql2', 'Bcl11a'))
+
+```
+```{r}
+
+#'Heg1', 'Pcdh8', 'Tox', 'Epha3', 'Gabrg1', 'Efna5', 'C1ql2', 'Bcl11a'
+
+FeaturePlot(PSN, features = "Heg1")
+FeaturePlot(PSN, features = "Pcdh8")
+FeaturePlot(PSN, features = "Tox")
+FeaturePlot(PSN, features = "Epha3")
+FeaturePlot(PSN, features = "Gabrg1")
+FeaturePlot(PSN, features = "Efna5")
+FeaturePlot(PSN, features = "C1ql2")
+FeaturePlot(PSN, features = "Bcl11a")
+```
+###Note: In this dataset, the expression of positional markers is quite mixed among the groups. Implying that this is not what is dominating the determination of respective clusters.
+
+## Cluster Selection:
+
+**Based on expression of on-target(Ntrk3, Etv1, etc.) and off-target markers (Ntrk2 & Ret), I think it makes sense to select 0,1,2,8 & 13, plus 4 & 12 as our proprioceptor cluster. -- We exclude 3,5,6,11 & 15 for expressing Ntrk2, which is an off-target marker. We also exclude the other groupfor not expressing the cannonical markers.**
+
+Once this is done, we'll re-project to
+remaining groups, and re-do the visualizations, with the aim of
+determining which markers play a roll in differentiation of different
+proprioceptor groups from eachother, and associating these group
+identities to those in the Oliver et al. paper.**
+
+Note: It's potentially useful to project the off-target cells separately
+and see if any of the groups separate. So, we'll create two new objects.
+
+```{r}
+#Create a new proprioceptor Seurat Object with just the clusters that match the proprioceptor profile
+PSN.proprio <- subset(x = PSN, idents = c("0", "1","2", "4","8", "12", "13"))
+#Create another Seurat object to house the "off-target" cells.
+PSN.offtarget <- subset(x = PSN, idents = c("3", "5", "6", "7", "9", "10", "11", "14", "15"))
+```
+
+```{r}
+#normalize again
+PSN.proprio <- NormalizeData(PSN.proprio, normalization.method = "LogNormalize", scale.factor = 10000)
+PSN.proprio <- FindVariableFeatures(PSN.proprio, selection.method = "vst", nfeatures = 2000)
+
+```
+
+```{r}
+PSN.proprio
+```
+
+```{r}
+PSN
+```
+
+Note: In a previous iteration of this notebook, we retained only \~1000
+cells. So ending up with \~4k is pretty good! Hopefully this is enough
+power to end up with all the major proprioceptor identities represented.
+
+```{r}
+top10 <- head(VariableFeatures(PSN.proprio), 10)
+top10
+```
+
+Very interesting....
+
+```{r}
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(PSN.proprio)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+#plot1 + plot2
+plot2
+```
+
+```{r}
+
+#scale again
+all.genes <- rownames(PSN.proprio)
+PSN.proprio <- ScaleData(PSN.proprio, features = all.genes)
+
+#run PCA again
+PSN.proprio <- RunPCA(PSN.proprio, features = VariableFeatures(object = PSN.proprio))
+
+```
+
+```{r}
+# Examine and visualize PCA results a few different ways
+print(PSN.proprio[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(PSN.proprio, dims = 1:2, reduction = "pca")
+DimPlot(PSN.proprio, reduction = "pca")
+DimHeatmap(PSN.proprio, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(PSN.proprio, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+```{r}
+#this is to determine how many dims (dimensions) to include in the clustering
+ElbowPlot(PSN.proprio)
+
+```
+
+Commenting this out, so that we can create a new plot using the old
+cluster labels. This avoids a fair bit of If we notice the clusters
+separating into sub-clusters, then perhaps reclustering makes sense.
+
+```{r}
+#Make the clusters
+# PSN.proprio <- FindNeighbors(PSN.proprio, dims = 1:20)
+# PSN.proprio <- FindClusters(PSN.proprio, resolution = 0.5)
+# PSN.proprio$celltype <- Idents(PSN.proprio)
+```
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 1:20)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.proprio, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+
+As an experiment, let's try making plots based on subsets of our Pcs, to see which ones
+account for the differences between particular clusters.
+
+#### Dims 1:5
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 1:5)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.proprio, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+#### Dims 6:10
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 6:10)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.proprio, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+
+#### Dims 11:15
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 11:15)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.proprio, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+
+#### Dims 16:20
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 16:20)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.proprio, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+
+
+#### Conclusions:
+
+Thinking about the concept that dimensionality reduction is destined to produce some distortions from reality, I'm not sure how to interpret these results. --But it does seem clear that the bulk of the group-level variation is captured in PCs 1-5. 
+
+For now, we utilize all 20 PCs for downstream projections, to avoid leaving any information on the table.
+
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 1:20)
+```
+
+We can filter again based on the canonical features;
+
+```{r}
+#plot nCount RNA and different features to explore subtypes
+FeaturePlot(PSN.proprio, features = c("nCount_RNA"))
+```
+
+```{r}
+
+#features = c("Whrn", "Parvb", "Runx3")
+FeaturePlot(PSN.proprio, features = "Whrn")
+FeaturePlot(PSN.proprio, features = "Parvb")
+FeaturePlot(PSN.proprio, features = "Runx3")
+FeaturePlot(PSN.proprio, features = "Etv1")
+FeaturePlot(PSN.proprio, features = "Ntrk3")
+```
+
+```{r}
+FeaturePlot(PSN.proprio, features = "Ntrk2")
+FeaturePlot(PSN.proprio, features = "Ret")
+```
+Note: I'm not sure how useful these two figures are, given that we've screened out high expressing clusters for each of these  markers and then re-normalized.
+
+```{r}
+FeaturePlot(PSN.proprio, features = "Nxph1")
+FeaturePlot(PSN.proprio, features = "Csmd3")
+```
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN.proprio, features = c('Nxph1', 'Csmd3'))
+```
+
+Reminder: In the P56 dataset, we found that Nxph1 and CSmd3 were quite useful in
+separating our five groups into 3 distinct identities.
+
+             Nxph1(-) Nxph1(+) 
+  
+    Csmd3(-) 2&4      0,1&3
+
+
+    Csdm3(+) 5        -
+    
+At E12.5, we find very little Nxph1 expression. The expression of Csmd3 is more concentrated. Perhaps we can use this to correlate back to the identity of these particular cells, but perhaps Csmd3 expression is only restricted to group 1b afferents at P56?
+
+--
+## Analysis of Differential Expression by cluster:
+
+```{r}
+#finding positive and negative markers of all clusters and write table. Table will appear as a text file in the set working directory
+PSN.proprio.markers <- FindAllMarkers(PSN.proprio, only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+write.table(PSN.proprio.markers, file = "RNAonly_Proprio_AllMarkers.txt", sep = "\t", quote = F)
+
+
+#these lines to plot heatmap of top genes in each group
+PSN.proprio.markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 2, order_by = avg_log2FC)
+
+```
+
+```{r}
+library(ggplot2)
+```
+
+```{r}
+# you can plot raw counts as well
+#VlnPlot(PSN.proprio, features = c("NKG7", "PF4"), slot = "counts", log = TRUE)
+PSN.proprio.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10
+
+p <-DoHeatmap(PSN.proprio, features = top10$gene) + NoLegend()
+p + theme(axis.text=element_text(size=3)) 
+```
+
+Unfortunately, I haven't figured out how to make the rows larger, which
+would solve our problem. But perhaps, the figure could be blown up.
+
+```{r}
+
+# find all positive and negative markers for each individual cluster
+
+#cluster0.markers <- FindMarkers(PSN.proprio, ident.1 = 0, min.pct = 0.25)
+#head(cluster0.markers, n = 5)
+
+#cluster1.markers <- FindMarkers(PSN.proprio, ident.1 = 1, min.pct = 0.25)
+#head(cluster0.markers, n = 5)
+
+#cluster2.markers <- FindMarkers(PSN.proprio, ident.1 = 2, min.pct = 0.25)
+#head(cluster2.markers, n = 5)
+
+#cluster4.markers <- FindMarkers(PSN.proprio, ident.1 = 4, min.pct = 0.25)
+#head(cluster4.markers, n = 5)
+
+#cluster8.markers <- FindMarkers(PSN.proprio, ident.1 = 8, min.pct = 0.25)
+#head(cluster3.markers, n = 5)
+
+#cluster12.markers <- FindMarkers(PSN.proprio, ident.1 = 12, min.pct = 0.25)
+#head(cluster12.markers, n = 5)
+
+#cluster13.markers <- FindMarkers(PSN.proprio, ident.1 = 13, min.pct = 0.25)
+#head(cluster13.markers, n = 5)
+
+```
+
+## Sub-Clusters:
+
+Reminder:
+
+```{r}
+PSN.proprio <- RunUMAP(PSN.proprio, dims = 1:20)
+DimPlot(PSN.proprio, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+
+Let's reproject groups 0, 1, 2, 8 &13.
+
+#Comparing groups 0, 1, 2, 8, 13.
+
+```{r}
+PSN.prop_ <- subset(x = PSN, idents = c(0, 1, 2, 8, 13))
+```
+
+```{r}
+#normalize again
+PSN.prop_ <- NormalizeData(PSN.prop_, normalization.method = "LogNormalize", scale.factor = 10000)
+PSN.prop_ <- FindVariableFeatures(PSN.prop_, selection.method = "vst", nfeatures = 2000)
+
+```
+
+```{r}
+PSN.prop_
+```
+
+Note: In a previous iteration of this notebook, we retained only \~1000
+cells. So ending up with \~4k is pretty good! Hopefully this is enough
+power to end up with all the major proprioceptor identities represented.
+
+```{r}
+top10 <- head(VariableFeatures(PSN.prop_), 10)
+top10
+```
+Notice: Itga2, Gabrg1 and Csmd3!
+
+```{r}
+
+#scale again
+all.genes <- rownames(PSN.prop_)
+PSN.prop_ <- ScaleData(PSN.prop_, features = all.genes)
+
+#run PCA again
+PSN.prop_ <- RunPCA(PSN.prop_, features = VariableFeatures(object = PSN.prop_))
+
+```
+
+```{r}
+# Examine and visualize PCA results a few different ways
+print(PSN.prop_[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(PSN.prop_, dims = 1:2, reduction = "pca")
+DimPlot(PSN.prop_, reduction = "pca")
+DimHeatmap(PSN.prop_, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(PSN.prop_, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+```{r}
+#this is to determine how many dims (dimensions) to include in the clustering
+ElbowPlot(PSN.prop_)
+
+```
+Again, let's preserve the same labels. --Also using only the first 5 PCs.
+
+```{r}
+PSN.prop_ <- RunUMAP(PSN.prop_, dims = 1:20)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.prop_, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+Let's see if any of the positional markers differ significantly across the two groups:
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN.prop_, features = c('Heg1', 'Pcdh8', 'Tox', 'Epha3', 'Gabrg1', 'Efna5', 'C1ql2', 'Bcl11a'))
+```
+```{r}
+
+#'Heg1', 'Pcdh8', 'Tox', 'Epha3', 'Gabrg1', 'Efna5', 'C1ql2', 'Bcl11a'
+
+FeaturePlot(PSN.prop_, features = "Heg1")
+FeaturePlot(PSN.prop_, features = "Pcdh8")
+FeaturePlot(PSN.prop_, features = "Tox")
+FeaturePlot(PSN.prop_, features = "Epha3")
+FeaturePlot(PSN.prop_, features = "Gabrg1")
+FeaturePlot(PSN.prop_, features = "Efna5")
+FeaturePlot(PSN.prop_, features = "C1ql2")
+FeaturePlot(PSN.prop_, features = "Bcl11a")
+```
+Only Tox appears to me to be correlated with a particular cluster.
+
+## Comparing groups 4 and 12.
+
+```{r}
+#Create a new proprioceptor Seurat Object with just the clusters that match the proprioceptor profile
+PSN.prop_ <- subset(x = PSN, idents = c("4", "12"))
+```
+
+```{r}
+#normalize again
+PSN.prop_ <- NormalizeData(PSN.prop_, normalization.method = "LogNormalize", scale.factor = 10000)
+PSN.prop_ <- FindVariableFeatures(PSN.prop_, selection.method = "vst", nfeatures = 2000)
+
+```
+
+```{r}
+PSN.prop_
+```
+
+```{r}
+top10 <- head(VariableFeatures(PSN.prop_), 10)
+top10
+```
+
+```{r}
+
+#scale again
+all.genes <- rownames(PSN.prop_)
+PSN.prop_ <- ScaleData(PSN.prop_, features = all.genes)
+
+#run PCA again
+PSN.prop_ <- RunPCA(PSN.prop_, features = VariableFeatures(object = PSN.prop_))
+
+```
+
+```{r}
+# Examine and visualize PCA results a few different ways
+print(PSN.prop_[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(PSN.prop_, dims = 1:2, reduction = "pca")
+DimPlot(PSN.prop_, reduction = "pca")
+DimHeatmap(PSN.prop_, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(PSN.prop_, dims = 1:15, cells = 500, balanced = TRUE)
+```
+Commenting this out, so that we can create a new plot using the old
+cluster labels. This avoids a fair bit of If we notice the clusters
+separating into sub-clusters, then perhaps reclustering makes sense.
+
+```{r}
+#Make the clusters
+# PSN.proprio <- FindNeighbors(PSN.proprio, dims = 1:20)
+# PSN.proprio <- FindClusters(PSN.proprio, resolution = 0.5)
+# PSN.proprio$celltype <- Idents(PSN.proprio)
+```
+
+```{r}
+PSN.prop_ <- RunUMAP(PSN.prop_, dims = 1:20)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.prop_, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+
+This is better separation than in the original UMAP!
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN.prop_, features = c('Heg1', 'Pcdh8', 'Tox', 'Epha3', 'Gabrg1', 'Efna5', 'C1ql2', 'Bcl11a'))
+```
+
+
+```{r}
+# Ridge plots - from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(PSN.proprio, features = c('Heg1', 'Pcdh8', 'Tox', 'Epha3', 'Gabrg1', 'Efna5', 'C1ql2', 'Bcl11a'))
+```
+
+## Comparing all the other groups
+
+Let's look at the off-target groups and see if there's any insight there.
+
+```{r}
+#normalize again
+PSN.offtarget <- NormalizeData(PSN.offtarget, normalization.method = "LogNormalize", scale.factor = 10000)
+PSN.offtarget <- FindVariableFeatures(PSN.offtarget, selection.method = "vst", nfeatures = 2000)
+```
+
+```{r}
+PSN.offtarget
+```
+
+```{r}
+top10 <- head(VariableFeatures(PSN.offtarget), 10)
+top10
+```
+
+```{r}
+
+#scale again
+all.genes <- rownames(PSN.offtarget)
+PSN.offtarget <- ScaleData(PSN.offtarget, features = all.genes)
+
+#run PCA again
+PSN.offtarget <- RunPCA(PSN.offtarget, features = VariableFeatures(object = PSN.offtarget))
+
+```
+
+```{r}
+# Examine and visualize PCA results a few different ways
+print(PSN.offtarget[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(PSN.offtarget, dims = 1:2, reduction = "pca")
+DimPlot(PSN.offtarget, reduction = "pca")
+DimHeatmap(PSN.offtarget, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(PSN.offtarget, dims = 1:15, cells = 500, balanced = TRUE)
+```
+Very interesting! --It's clease that PC1 contains most of the information here.
+
+```{r}
+#this is to determine how many dims (dimensions) to include in the clustering
+ElbowPlot(PSN.offtarget)
+
+```
+^This looks like over-fitting.
+
+
+Commenting this out, so that we can create a new plot using the old
+cluster labels. This avoids a fair bit of If we notice the clusters
+separating into sub-clusters, then perhaps reclustering makes sense.
+
+```{r}
+#Make the clusters
+# PSN.proprio <- FindNeighbors(PSN.proprio, dims = 1:20)
+# PSN.proprio <- FindClusters(PSN.proprio, resolution = 0.5)
+# PSN.proprio$celltype <- Idents(PSN.proprio)
+```
+
+```{r}
+PSN.offtarget <- RunUMAP(PSN.offtarget, dims = 1:20)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# plot the proprioceptor clusters
+DimPlot(PSN.offtarget, label = TRUE, label.size = 2.5, repel = TRUE)
+
+```
+As in other versions of this notebook, we seem to get two very distinct groups of off-target cells. Based on what we know, it seems reasonable to assume that the left-most group is composed on mechanoreceptors. --We're not sure what the group on the right is, but perhaps there are just cell fragments which were included when we chose to use the raw matrix.
+
+
+
+#ATAC Section --Not fleshed out.
+
+Finally, this section of the notebook is concerned with identifying
+enriched motifs by group:
+
+Note: 'chromVar' is one of those troublesome packages. Some combination
+of the steps below will work. Maybe.
+
+```{r}
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("GO.db")
+#devtools::install_github("GreenleafLab/chromVAR")
+```
+
+```{r}
+# if (!require("chromVar", quietly = TRUE))
+# install.packages("chromVar")
+
+# if (!require("BiocManager", quietly = TRUE))
+# install.packages("BiocManager")
+```
+
+```{r}
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("chromVAR")
+```
+
+```{r}
+library(chromVAR)
+```
+
+```{r}
+# BiocManager::install("JASPAR2020") #A whole bunch of things that hopefully only need to be
+# BiocManager::install("TFBSTools")  #installed once...
+# BiocManager::install("GO.db")
+# BiocManager::install("motifmatchr")
+
+library(JASPAR2020)
+library(TFBSTools)
+library(motifmatchr)
+library(BSgenome.Mmusculus.UCSC.mm10)
+```
+
+```{r}
+# Scan the DNA sequence of each peak for the presence of each motif, and create a Motif object
+DefaultAssay(PSN.proprio) <- "ATAC"
+pwm_set <- getMatrixSet(x = JASPAR2020, opts = list(species = 9606, all_versions = FALSE))
+motif.matrix <- CreateMotifMatrix(features = granges(PSN.proprio), pwm = pwm_set, genome = 'mm10', use.counts = FALSE)
+motif.object <- CreateMotifObject(data = motif.matrix, pwm = pwm_set)
+PSN.proprio <- SetAssayData(PSN.proprio, assay = 'ATAC', slot = 'motifs', new.data = motif.object)
+```
+
+```{r}
+PSN.proprio
+```
+
+```{r}
+# Note that this step can take 30-60 minutes 
+PSN.proprio <- RunChromVAR(
+  object = PSN.proprio,
+  genome = BSgenome.Mmusculus.UCSC.mm10
+)
+```
+
+```{r}
+#Apparently "prestoR" is discontinued. So, to install it also requires a bit of extra work.
+
+
+# install.packages("remotes")
+# remotes::install_github("immunogenomics/presto")
+
+library("presto")
+```
+
+```{r}
+# 'celltype' not available.
+markers_rna <- presto:::wilcoxauc.Seurat(X = PSN.proprio, assay = 'data', seurat_assay = 'RNA')
+markers_motifs <- presto:::wilcoxauc.Seurat(X = PSN.proprio, assay = 'data', seurat_assay = 'ATAC')
+```
+
+```{r}
+#markers_rna <- presto:::wilcoxauc.Seurat(X = PSN.proprio, group_by = 'celltype', assay = 'data', seurat_assay = 'RNA')
+#markers_motifs <- presto:::wilcoxauc.Seurat(X = PSN.proprio, group_by = 'celltype', assay = 'data', seurat_assay = 'chromvar')
+motif.names <- markers_motifs$feature
+colnames(markers_rna) <- paste0("RNA.", colnames(markers_rna))
+colnames(markers_motifs) <- paste0("motif.", colnames(markers_motifs))
+markers_rna$gene <- markers_rna$RNA.feature
+markers_motifs$gene <- ConvertMotifID(PSN.proprio, id = motif.names)
+```
+
+```{r}
+# a simple function to implement the procedure above
+topTFs <- function(celltype, padj.cutoff = 1e-2) {
+  ctmarkers_rna <- dplyr::filter(
+    markers_rna, RNA.group == celltype, RNA.padj < padj.cutoff, RNA.logFC > 0) %>% 
+    arrange(-RNA.auc)
+  ctmarkers_motif <- dplyr::filter(
+    markers_motifs, motif.group == celltype, motif.padj < padj.cutoff, motif.logFC > 0) %>% 
+    arrange(-motif.auc)
+  top_tfs <- inner_join(
+    x = ctmarkers_rna[, c(2, 1, 11, 6, 7)], 
+    y = ctmarkers_motif[, c(2, 1, 11, 6, 7)], by = "gene"
+  )
+  top_tfs$avg_auc <- (top_tfs$RNA.auc + top_tfs$motif.auc) / 2
+  top_tfs <- arrange(top_tfs, -avg_auc)
+  return(top_tfs)
+}
+```
+
+--Temporarily commented out in order to render notebook:
+
+```{r}
+#markers_rna$gene <- toupper(markers_rna$gene)
+
+#head(topTFs("1"), 10)
+
+#motif.name <- ConvertMotifID(PSN.proprio, name = 'FOXP1')
+```
+
+Note: 1. It appears we didn't do a UMAP reduction for this object, using
+PCA as a workaround. 2. We are unable to find 'sct_Foxp1' as a feature
+in this dataset. Workaround:
+
+```{r}
+#library("Seurat") #It keeps being unable to find functions...
+
+ #gene_plot <- FeaturePlot(PSN.proprio, features = "sct_Foxp1", reduction = 'wnn.umap')
+#gene_plot <- FeaturePlot(PSN.proprio, features = "Parvb", reduction = 'pca')
+#motif_plot <- FeaturePlot(PSN.proprio, features = motif.name, min.cutoff = 0, cols = c("lightgrey", "darkred"), reduction = 'pca') #'wnn.umap')
+#gene_plot | motif_plot
+```
+
+```{r}
+#library("Seurat") #It keeps being unable to find functions...
+
+ #gene_plot <- FeaturePlot(PSN.proprio, features = "sct_Foxp1", reduction = 'wnn.umap')
+#gene_plot <- FeaturePlot(PSN.proprio, features = "Runx3", reduction = 'pca')
+#motif_plot <- FeaturePlot(PSN.proprio, features = motif.name, min.cutoff = 0, cols = c("lightgrey", "darkred"), reduction = 'pca') #'wnn.umap')
+#gene_plot | motif_plot
+```
+
+Need to comment this out for the time being. Trying to knit to html, and
+this line keeps crashing it:
+
+```{r}
+# save(PSN.proprio.p0s, file="PSN.proprioclusters.p0.Robj")
+# save(PSN2.proprio.p0, file="PSN2.proprioclusters.p0.Robj")
+```
+
+```{r}
+#This is to make fasta files and using external motif enrichment programs
+#in terminal
+#cd /Users/tulsipatel/Documents/Wichterle_Lab/SingleCellData/JT001
+#awk '{split($0,a,/[--]/); print a[1] "\t" a[2] "\t" a[3]}' PSN_proprio_cluster3peaksup.txt > PSN_proprio_cluster3peaksup.bed
+#awk '{split($0,a,/[--]/); print a[1] "\t" a[2] "\t" a[3]}' PSN_proprio_cluster3peaksdown.txt > PSN_proprio_cluster3peaksdown.bed
+
+#up was giving error in fa step so manually did it
+#cat PSN_proprio_cluster3peaksup.txt > PSN_proprio_cluster3peaksup.bed
+
+#bedtools getfasta -fi ~/Desktop/mm10.fa -bed PSN_proprio_cluster3peaksdown.bed -fo PSN_proprio_cluster3peaksdown.fa
+#bedtools getfasta -fi ~/Desktop/mm10.fa -bed PSN_proprio_cluster3peaksup.bed -fo PSN_proprio_cluster3peaksup.fa
+
+
+
+#to remove data from the environment 
+#rm(PSN.proprio)
+```
